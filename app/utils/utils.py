@@ -69,8 +69,15 @@ def root_dir():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
+def reel_media_root() -> str:
+    """唤星 reel 存储根（doc19 §5）：daemon 注入 REEL_MEDIA_ROOT 时，所有产物 + 素材缓存
+    都落该目录的子目录（task_dir/cache_videos/local_videos…）；未注入回落 `{root}/storage`
+    （本地 dev 直跑）。集中此一处，便于 upstream rebase。"""
+    return os.environ.get("REEL_MEDIA_ROOT", "").strip() or os.path.join(root_dir(), "storage")
+
+
 def storage_dir(sub_dir: str = "", create: bool = False):
-    d = os.path.join(root_dir(), "storage")
+    d = reel_media_root()
     if sub_dir:
         d = os.path.join(d, sub_dir)
     if create and not os.path.exists(d):

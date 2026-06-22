@@ -21,13 +21,15 @@ class UploadPostService:
     def __init__(self):
         self.api_key = config.app.get("upload_post_api_key", "")
         self.username = config.app.get("upload_post_username", "")
-        self.enabled = config.app.get("upload_post_enabled", False)
+        # 唤星 reel（doc19 §9 M4）：第三方一键发社媒本期硬编码关闭——
+        # 第三方凭据/合规风险高；自动发社媒高敏感外发；分发归口唤星自有体系。
+        self.enabled = False
         self.platforms = config.app.get("upload_post_platforms", ["tiktok", "instagram"])
-        self.auto_upload = config.app.get("upload_post_auto_upload", False)
+        self.auto_upload = False
 
     def is_configured(self) -> bool:
-        """Check if Upload-Post is properly configured."""
-        return bool(self.api_key and self.username and self.enabled)
+        """唤星 reel：第三方发布硬关闭，永远返回 False（doc19 §9 M4）。"""
+        return False
 
     def upload_video(
         self,

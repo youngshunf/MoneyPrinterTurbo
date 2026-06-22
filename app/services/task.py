@@ -215,6 +215,33 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+def _covered_seconds(materials, max_clip_duration) -> float:
+    """已自带素材能覆盖的时间线秒数：每段贡献 min(片段时长, max_clip_duration)。
+
+    与库存下载的覆盖统计口径一致（material.download_videos 用 min(max_clip_duration, duration)）。
+    纯函数，便于单测（doc19 §6.6 缺口计算）。"""
+    total = 0.0
+    for m in materials or []:
+        try:
+            duration = float(getattr(m, "duration", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration <= 0:
+            # 自带素材未带 duration 时，保守按一个完整 clip 计（避免误判为 0 覆盖而过量补库存）。
+            duration = float(max_clip_duration)
+        total += min(duration, float(max_clip_duration))
+    return total
+
+
+def compute_material_gap(covered_seconds: float, required_seconds: float) -> float:
+    """自带优先 + 库存补缺的缺口（秒）：required - covered，下限 0（doc19 §6.6）。
+
+    纯函数、无 IO，单测覆盖：自带足够→0、部分自带→正缺口、零自带→全缺口、负输入归一。"""
+    covered = max(0.0, float(covered_seconds or 0))
+    required = max(0.0, float(required_seconds or 0))
+    return max(0.0, required - covered)
+
+
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -228,6 +255,11 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+    elif params.video_source == "auto":
+        # 唤星 reel 增强（doc19 §6.6）：自带优先 + 库存自动补缺（单一入口）。
+        # 先用自带素材，按配音时长算覆盖缺口，缺口>0 才用搜索词补库存，再拼接。
+        # 这是 fork 新增语义（MPT 原生 video_source 是 local XOR 库存，不混）。
+        return _get_video_materials_auto(task_id, params, video_terms, audio_duration)
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
@@ -253,6 +285,91 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return downloaded_videos
+
+
+def _resolve_stock_source(params) -> str:
+    """video_source=auto 下补库存用的实际 provider（auto 非真实 provider 名）。
+
+    取 config.app.video_source（PDC 注入 pexels/pixabay），缺省 pexels。"""
+    configured = str(config.app.get("video_source", "") or "").strip().lower()
+    if configured in ("pexels", "pixabay", "coverr"):
+        return configured
+    return "pexels"
+
+
+def _get_video_materials_auto(task_id, params, video_terms, audio_duration):
+    """自带优先 + 库存自动补缺（doc19 §6.6）。
+
+    1. 先 preprocess 自带素材（params.video_materials）；
+    2. 按 audio_duration*video_count 算需覆盖时长与自带覆盖缺口（compute_material_gap）；
+    3. 缺口>0 才用 video_terms 搜库存、只下载补缺所需片段；
+    4. 自带 + 补充按序拼接（自带在前）。
+    自带足够时完全不下载（不烧库存额度）。
+    """
+    required_seconds = float(audio_duration) * float(params.video_count or 1)
+
+    # ① 自带素材（可为空）。
+    owned_materials = video.preprocess_video(
+        materials=params.video_materials or [],
+        clip_duration=params.video_clip_duration,
+    )
+    owned_paths = [m.url for m in owned_materials]
+    covered = _covered_seconds(owned_materials, params.video_clip_duration)
+    gap = compute_material_gap(covered, required_seconds)
+    logger.info(
+        f"auto materials: owned={len(owned_paths)} covered={covered:.1f}s "
+        f"required={required_seconds:.1f}s gap={gap:.1f}s"
+    )
+
+    # ② 自带足够：不下载库存。
+    if gap <= 0:
+        if not owned_paths:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error("auto source: no owned materials and zero required duration.")
+            return None
+        logger.success("auto materials: owned materials cover the timeline, skip stock.")
+        return owned_paths
+
+    # ③ 缺口>0 但没有搜索词可补：自带有则用自带，否则失败。
+    if not video_terms:
+        if owned_paths:
+            logger.warning(
+                "auto materials: gap remains but no search terms to fill stock; "
+                "proceeding with owned materials only."
+            )
+            return owned_paths
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error("auto source: gap remains and no search terms to fill stock.")
+        return None
+
+    # ④ 用搜索词补库存，只下载补缺所需（audio_duration 参数即缺口）。
+    stock_source = _resolve_stock_source(params)
+    logger.info(f"\n\n## auto-filling {gap:.1f}s gap from stock source: {stock_source}")
+    filled = material.download_videos(
+        task_id=task_id,
+        search_terms=video_terms,
+        source=stock_source,
+        video_aspect=params.video_aspect,
+        video_concat_mode=(
+            VideoConcatMode.sequential
+            if params.match_materials_to_script
+            else params.video_concat_mode
+        ),
+        audio_duration=gap,
+        max_clip_duration=params.video_clip_duration,
+        match_script_order=params.match_materials_to_script,
+    )
+    combined = owned_paths + (filled or [])
+    if not combined:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(
+            "auto source: no usable materials (owned empty and stock fill failed)."
+        )
+        return None
+    logger.success(
+        f"auto materials: {len(owned_paths)} owned + {len(filled or [])} stock filled."
+    )
+    return combined
 
 
 def generate_final_videos(

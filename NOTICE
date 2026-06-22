@@ -1,0 +1,40 @@
+MoneyPrinterTurbo — 唤星 (Huanxing) reel fork
+================================================
+
+This repository is a fork of MoneyPrinterTurbo, adapted for the 唤星 (Huanxing)
+AI-Native application platform as the "reel" short-video synthesis engine
+(app_id = `reel`, downloadable_local sidecar form).
+
+Upstream
+--------
+Project : MoneyPrinterTurbo
+Source  : https://github.com/harry0703/MoneyPrinterTurbo
+License : MIT License
+Copyright (c) 2024 Harry
+
+The upstream MIT license is retained in full in the LICENSE file. All upstream
+code remains under the MIT License.
+
+Huanxing fork modifications
+---------------------------
+Branch  : huanxing-reel
+Scope (design doc: docs/hasn-node设计文档/14-AI-Native应用平台/19-MoneyPrinterTurbo短视频合成应用接入设计.md):
+
+- app/config/config.py        : REEL_* runtime env injection (PDC authority), gateway
+                                 credentials helper, LLM failover list, upload_post off.
+- app/services/llm.py         : LLM gateway capture + candidate-chain failover with real
+                                 upstream error pass-through (new-api OpenAI-compatible).
+- app/services/voice.py       : reel TTS provider switch (edge default / platform skeleton).
+- app/services/material.py    : stock keys injected via REEL_PEXELS/PIXABAY_API_KEYS
+                                 (multi-key rotation; consumed unchanged via config).
+- app/utils/utils.py          : storage root redirect to REEL_MEDIA_ROOT.
+- app/services/task.py        : video_source=auto (owned-first + stock gap-fill, §6.6).
+- app/api/huanxing_security.py: token gate (X-Reel-Token) + Host gate + CORS hardening.
+- app/controllers/v1/reel.py  : new /api/v1/reel/* endpoints (materials/search + JSONL events).
+- app/router.py, app/asgi.py  : wiring for the above.
+- app/services/upload_post.py : third-party publishing hard-disabled (§9).
+
+Modified/new files carry an inline "唤星 reel" comment marking the change.
+
+Huanxing fork changes are likewise provided under the MIT License, consistent
+with the upstream project.

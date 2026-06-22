@@ -932,7 +932,9 @@ class TestSocialMetadata(unittest.TestCase):
         )
 
         with patch.object(llm, "_generate_response", return_value=llm_response):
-            response = TestClient(app).post(
+            # 唤星 reel：sidecar 默认 Host 闸只放行 loopback（doc19 §8），TestClient 默认
+            # Host=testserver 会被 TrustedHostMiddleware 400。用 localhost 作 Host 进白名单。
+            response = TestClient(app, base_url="http://localhost").post(
                 "/api/v1/social-metadata",
                 json=request_body,
             )

@@ -196,4 +196,92 @@ ffmpeg_path = app.get("ffmpeg_path", "")
 if ffmpeg_path and os.path.isfile(ffmpeg_path):
     os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
 
+
+# ── 唤星 reel 收编：daemon 运行时注入（env 优先于 config.toml）─────────────────────────
+# 设计 doc19 §6：模型/素材 key 唯一权威是 PDC（daemon 注入 env），sidecar 不持默认值兜底。
+# 改动集中在此一处（config.py）+ 各 service 薄改读这些键，便于 upstream rebase（§6.5）。
+# 契约见 doc19 §4.3 配置注入表 与 实施清单 P1。
+def _csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "").strip()
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def apply_reel_runtime_env() -> None:
+    """把 daemon 注入的 REEL_* env 叠加到已加载的 config（env 覆盖 config.toml）。
+
+    env 未设时回落 config.toml（本地 dev 直跑不受影响）。
+    """
+    # 1) LLM 网关收编（doc19 §6.1）：锁 llm_provider=openai 兼容、base_url/key 指向 new-api。
+    gateway_base = os.environ.get("REEL_GATEWAY_BASE_URL", "").strip()
+    gateway_key = os.environ.get("REEL_GATEWAY_API_KEY", "").strip()
+    if gateway_base and gateway_key:
+        app["llm_provider"] = "openai"
+        app["openai_base_url"] = gateway_base
+        app["openai_api_key"] = gateway_key
+        # 模型名可选 override；未设则沿用 config.toml 的 openai_model_name。
+        model_llm = os.environ.get("REEL_MODEL_LLM", "").strip()
+        if model_llm:
+            app["openai_model_name"] = model_llm
+
+    # 主模型上游连挂时按序切换的兜底候选（doc19 §6.1 failover；env 未设 = 空列表，行为同前）。
+    fallbacks = _csv_env("REEL_MODEL_LLM_FALLBACKS")
+    if fallbacks:
+        app["llm_model_fallbacks"] = fallbacks
+
+    # 2) TTS（doc19 §6.2）：默认 edge 免费；provider/voice 由 daemon 注入。
+    tts_provider = os.environ.get("REEL_TTS_PROVIDER", "").strip().lower()
+    if tts_provider:
+        app["reel_tts_provider"] = tts_provider
+    voice_name = os.environ.get("REEL_VOICE_NAME", "").strip()
+    if voice_name:
+        app["reel_voice_name"] = voice_name
+    voice_rate = os.environ.get("REEL_VOICE_RATE", "").strip()
+    if voice_rate:
+        app["reel_voice_rate"] = voice_rate
+
+    # 3) 字幕（doc19 §6.4）：默认 edge（不下 whisper）。
+    subtitle_provider = os.environ.get("REEL_SUBTITLE_PROVIDER", "").strip().lower()
+    if subtitle_provider:
+        app["subtitle_provider"] = subtitle_provider
+    whisper_size = os.environ.get("REEL_WHISPER_MODEL_SIZE", "").strip()
+    if whisper_size:
+        whisper["model_size"] = whisper_size
+
+    # 4) 库存素材 key 收编（doc19 §6.3 M2）：平台兜底 + owner 自填，多 key 轮换。
+    pexels_keys = _csv_env("REEL_PEXELS_API_KEYS")
+    if pexels_keys:
+        app["pexels_api_keys"] = pexels_keys
+    pixabay_keys = _csv_env("REEL_PIXABAY_API_KEYS")
+    if pixabay_keys:
+        app["pixabay_api_keys"] = pixabay_keys
+
+    # 5) 存储根（doc19 §5）：产物/素材缓存全部落 REEL_MEDIA_ROOT 子目录（见 utils.storage_dir）。
+    #    实际重定向在 app/utils/utils.py::storage_dir() 读 REEL_MEDIA_ROOT，这里仅记录用于诊断。
+
+    # 6) 砍第三方发布（doc19 §9 M4）：硬编码关闭，daemon 不应注入开启。
+    app["upload_post_enabled"] = False
+    app["upload_post_auto_upload"] = False
+
+
+def gateway_credentials():
+    """唤星 reel 收编：读网关 env (base_url, api_key)；任一缺失返回 None（回落原生 provider）。
+
+    网关模式下 LLM 客户端强制走 new-api OpenAI 兼容端点（PDC 注入的模型名可能不含 'gpt'，
+    按模型名分派会误路由）。返回 (base_url, api_key) 或 None。
+    """
+    base_url = os.environ.get("REEL_GATEWAY_BASE_URL", "").strip()
+    api_key = os.environ.get("REEL_GATEWAY_API_KEY", "").strip()
+    return (base_url, api_key) if base_url and api_key else None
+
+
+def reel_llm_model_fallbacks() -> list[str]:
+    """读 LLM failover 兜底候选列表（daemon 经 REEL_MODEL_LLM_FALLBACKS 注入）。"""
+    value = app.get("llm_model_fallbacks", [])
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item).strip() for item in (value or []) if str(item).strip()]
+
+
+apply_reel_runtime_env()
+
 logger.info(f"{project_name} v{project_version}")

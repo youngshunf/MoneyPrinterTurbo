@@ -136,11 +136,115 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
+# ── 唤星 reel LLM 收编 + failover（doc19 §6.1）──────────────────────────────────────
+# 锁 OpenAI 兼容路径，注入网关 base_url/key；构造候选链 [主模型]+[REEL_MODEL_LLM_FALLBACKS]，
+# 上游连续报错按序切下一模型，透传真实上游状态码+消息（参考 VideoClaw GPT.query failover）。
+# 集中此处，便于 upstream rebase（其余 provider 分支保持原样）。
+_REEL_PER_MODEL_ATTEMPTS = 3
+
+
+def _reel_candidate_models(primary: str, fallbacks: List[str]) -> List[str]:
+    """主模型排首，叠加兜底候选；去空、去重、保序。永不返回空列表。"""
+    ordered = [primary] + list(fallbacks or [])
+    seen: set[str] = set()
+    result: List[str] = []
+    for name in ordered:
+        name = (name or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result or ["gpt-4o-mini"]
+
+
+def _reel_is_retryable(error: object) -> bool:
+    """瞬时错误（连接/超时/限流/5xx 上游）可重试；4xx（鉴权/模型不存在/参数/余额）不可重试。"""
+    try:
+        from openai import APIConnectionError, APITimeoutError, RateLimitError
+
+        if isinstance(error, (APIConnectionError, APITimeoutError, RateLimitError)):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return status >= 500
+    return True  # 未知异常保守按可重试处理。
+
+
+def _reel_format_upstream_error(error: object) -> str:
+    """提取真实上游错误（含状态码与网关 message，如 do_request_failed），供日志与最终抛出。"""
+    if error is None:
+        return "unknown error"
+    detail = None
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            detail = err.get("message")
+        elif isinstance(err, str):
+            detail = err
+    if not detail:
+        detail = str(error)
+    detail = _sanitize_error_message(detail)
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return f"HTTP {status}: {detail}"
+    return detail
+
+
+def _reel_generate_via_gateway(prompt: str, base_url: str, api_key: str) -> str:
+    """走 new-api OpenAI 兼容网关，候选链 failover。透传真实上游错误（不吞成泛化文案）。"""
+    primary = config.app.get("openai_model_name") or ""
+    if not primary:
+        raise ValueError("reel: openai_model_name (REEL_MODEL_LLM) is not set")
+    fallbacks = config.reel_llm_model_fallbacks()
+    candidates = _reel_candidate_models(primary, fallbacks)
+    # 多候选时单模型重试更少、尽快切健康上游；单候选时保留较强韧性。
+    per_model_attempts = (
+        _max_retries if len(candidates) <= 1 else min(_REEL_PER_MODEL_ATTEMPTS, _max_retries)
+    )
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+    last_error: object = None
+    last_model = candidates[0]
+    for cand in candidates:
+        last_model = cand
+        for attempt in range(per_model_attempts):
+            try:
+                response = client.chat.completions.create(
+                    model=cand, messages=[{"role": "user", "content": prompt}]
+                )
+                return _extract_chat_completion_text(response, "openai")
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if not _reel_is_retryable(exc):
+                    logger.warning(
+                        f"reel llm model {cand} hit non-retryable error, "
+                        f"switching candidate: {_reel_format_upstream_error(exc)}"
+                    )
+                    break
+                logger.warning(
+                    f"reel llm model {cand} attempt {attempt + 1}/{per_model_attempts} "
+                    f"failed (retryable): {_reel_format_upstream_error(exc)}"
+                )
+    # 全部候选失败 —— 把真实上游错误透出来，便于排障。
+    raise RuntimeError(
+        f"reel llm failover exhausted, candidates {candidates} all failed. "
+        f"last error (model {last_model}): {_reel_format_upstream_error(last_error)}"
+    )
+
+
 def _generate_response(prompt: str) -> str:
     try:
         content = ""
         llm_provider = config.app.get("llm_provider", "openai")
         logger.info(f"llm provider: {llm_provider}")
+        # 唤星 reel 收编：网关已注入时，强制走 new-api OpenAI 兼容 + 候选链 failover，
+        # 短路上游所有 per-provider 分支（doc19 §6.1）。
+        gateway_credentials = config.gateway_credentials()
+        if gateway_credentials is not None:
+            base_url, api_key = gateway_credentials
+            return _reel_generate_via_gateway(prompt, base_url, api_key)
         if llm_provider == "g4f":
             if not config.app.get("enable_g4f", False):
                 raise ValueError(

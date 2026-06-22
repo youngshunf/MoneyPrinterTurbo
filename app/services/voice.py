@@ -298,6 +298,15 @@ def generate_silent_audio(duration_seconds: float, output_file: str) -> bool:
     return True
 
 
+def _reel_tts_provider() -> str:
+    """唤星 reel TTS provider（doc19 §6.2）：默认 edge 免费；platform 走 new-api（owner 配额）。
+
+    platform 档的实际调用归 daemon 侧 `hasn.voice.synthesize`（MEDIA-VOICE），不在 sidecar fork 内
+    直连——这里保留 provider 切换骨架，platform 时回落 edge 并明确告警（infra-gated）。
+    """
+    return str(config.app.get("reel_tts_provider", "edge")).strip().lower()
+
+
 def tts(
     text: str,
     voice_name: str,
@@ -305,6 +314,13 @@ def tts(
     voice_file: str,
     voice_volume: float = 1.0,
 ) -> Union[SubMaker, None]:
+    # 唤星 reel：platform TTS 档由 daemon hasn.voice.synthesize 承接（doc19 §6.2，infra-gated）；
+    # sidecar 内回落 edge，避免带病静默产空音轨。
+    if _reel_tts_provider() == "platform":
+        logger.warning(
+            "REEL_TTS_PROVIDER=platform: platform TTS is served by daemon "
+            "hasn.voice.synthesize (infra-gated), sidecar falls back to edge-tts."
+        )
     if is_no_voice(voice_name):
         duration_seconds = estimate_no_voice_duration(text)
         if not generate_silent_audio(duration_seconds, voice_file):

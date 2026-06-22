@@ -1,14 +1,12 @@
 """Application implementation - ASGI."""
 
-import os
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from app.api.huanxing_security import apply_huanxing_hardening
 from app.config import config
 from app.models.exception import HttpException
 from app.router import root_api_router
@@ -52,16 +50,9 @@ def get_application() -> FastAPI:
 
 app = get_application()
 
-# Configures the CORS middleware for the FastAPI app
-cors_allowed_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-origins = cors_allowed_origins_str.split(",") if cors_allowed_origins_str else ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 唤星 reel 安全加固（doc19 §8 / PRES-P2-e）：替代上游裸 `allow_origins=['*']`，
+# 装配 CORS 收敛 + Host 闸（默认 loopback）+ sidecar token 闸（X-Reel-Token，env-gated）。
+apply_huanxing_hardening(app)
 
 task_dir = utils.task_dir()
 app.mount(
