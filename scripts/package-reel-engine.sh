@@ -286,7 +286,7 @@ process_one_arch() {
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "${COPY_EXCLUDES[@]}" "${SRC}/" "${STAGE}/backend/"
   else
-    cp -R "${SRC}/" "${STAGE}/backend/"
+    cp -R "${SRC}/." "${STAGE}/backend/"   # /. 拷内容而非把 backend 目录多套一层（Git Bash cp 语义）
     ( cd "${STAGE}/backend" && rm -rf .venv .venv-* .git node_modules tests test .pytest_cache .ruff_cache \
         config.toml config.yaml webui docs reel_p0_compose.py \
         && find . -name '__pycache__' -type d -prune -exec rm -rf {} + \
@@ -420,10 +420,17 @@ PY
     # 服务端权威算 sha256（交叉校验）+ size，落公共桶，写 config_json.engine，push platform_config。
     # token 经 Authorization 头（不进 URL/日志）；-sS 静默但报错，-w 附 HTTP 码。
     local HTTP_BODY_FILE="${OUT_DIR}/.publish-resp-${OS_ARCH}.json" HTTP_CODE
-    HTTP_CODE="$(curl -sS -o "${HTTP_BODY_FILE}" -w '%{http_code}' \
+    # Windows：mingw/msys curl 的 -F @file / -o 需原生 Windows 路径（MSYS 不会转 -F 里内嵌的 @路径，
+    # 否则 curl 报 (26) Failed to open/read local data）。用 cygpath -m 转成 D:/… 前斜杠 Windows 路径。
+    local CURL_PKG_PATH="${PKG_PATH}" CURL_BODY_FILE="${HTTP_BODY_FILE}"
+    if [[ "${OS_KEY}" == "win" ]] && command -v cygpath >/dev/null 2>&1; then
+      CURL_PKG_PATH="$(cygpath -m "${PKG_PATH}")"
+      CURL_BODY_FILE="$(cygpath -m "${HTTP_BODY_FILE}")"
+    fi
+    HTTP_CODE="$(curl -sS -o "${CURL_BODY_FILE}" -w '%{http_code}' \
       -X POST "${ENDPOINT}" \
       -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-      -F "file=@${PKG_PATH};type=application/zip" \
+      -F "file=@${CURL_PKG_PATH};type=application/zip" \
       -F "os_arch=${OS_ARCH}" \
       -F "version=${VERSION}" \
       -F "sha256=${SHA256}" || echo "000")"
