@@ -224,7 +224,10 @@ fi
 
 if [[ "${NO_VENV}" != "1" ]]; then
   command -v uv >/dev/null 2>&1 || { echo "[reel-pkg] 需要 uv 安装 standalone Python（或加 --no-venv 仅验证流水线）" >&2; exit 1; }
-  command -v rsync >/dev/null 2>&1 || { echo "[reel-pkg] 需要 rsync 实体化拷贝解释器树（-aL 解引用 symlink）" >&2; exit 1; }
+  # Windows 用 cp -R 拷贝解释器树（standalone 标准库树无 symlink）；其余平台用 rsync -aL 解引用 symlink。
+  if [[ "${OS_KEY}" != "win" ]]; then
+    command -v rsync >/dev/null 2>&1 || { echo "[reel-pkg] 需要 rsync 实体化拷贝解释器树（-aL 解引用 symlink）" >&2; exit 1; }
+  fi
 fi
 
 # 发布前置：fail-fast，缺要素立即报错（别等打完几百 MB 才发现没法上传）。
@@ -299,26 +302,39 @@ process_one_arch() {
   # reel 特有：本地合成依赖随包占位（见 bundle_deps_placeholder 注释）。
   bundle_deps_placeholder "${STAGE}/backend" "${OS_ARCH}"
 
-  # venv：自带 standalone Python（relocatable）+ rsync -aL 实体化 symlink。详见脚本头注。
+  # venv：自带 standalone Python（relocatable）。Unix：rsync -aL 实体化 symlink（.venv/bin/python3.12）；
+  # Windows：解释器树无 symlink 且 python.exe 在树根，cp -R 整树到 .venv（.venv/python.exe 自定位 stdlib，
+  # 无 trampoline、可重定位）——daemon gateway 的 Windows 候选含 .venv/python.exe。详见脚本头注。
   if [[ "${NO_VENV}" != "1" ]]; then
     local PY_SPEC="cpython-3.12-${PY_OS}-${ARCH_KEY}"
     local VENV="${STAGE}/backend/.venv"
     echo "[reel-pkg] 安装目标架构 standalone Python: ${PY_SPEC}"
     uv python install "${PY_SPEC}"
-    local PY_DIR_ROOT PY_HOME
+    local PY_DIR_ROOT PY_HOME SRC_PY VENV_PY
     PY_DIR_ROOT="$(uv python dir 2>/dev/null || echo "${HOME}/.local/share/uv/python")"
     PY_HOME="$(ls -d "${PY_DIR_ROOT}"/cpython-3.12.*-"${PY_OS}"-"${ARCH_KEY}"-none 2>/dev/null | sort -V | tail -1)"
-    if [[ -z "${PY_HOME}" || ! -x "${PY_HOME}/bin/python3.12" ]]; then
-      echo "[reel-pkg] 定位 standalone Python 安装根失败（PY_DIR_ROOT=${PY_DIR_ROOT}，期望 cpython-3.12.*-${PY_OS}-${ARCH_KEY}-none）" >&2
+    # 解释器与目标 venv 内 python 路径按 OS 分叉：Windows=树根 python.exe（无 bin/）；其余=bin/python3.12。
+    if [[ "${OS_KEY}" == "win" ]]; then
+      SRC_PY="${PY_HOME}/python.exe"; VENV_PY="${VENV}/python.exe"
+    else
+      SRC_PY="${PY_HOME}/bin/python3.12"; VENV_PY="${VENV}/bin/python3.12"
+    fi
+    if [[ -z "${PY_HOME}" || ! -x "${SRC_PY}" ]]; then
+      echo "[reel-pkg] 定位 standalone Python 安装根失败（PY_DIR_ROOT=${PY_DIR_ROOT}，期望 cpython-3.12.*-${PY_OS}-${ARCH_KEY}-none 内 python）" >&2
       exit 1
     fi
-    echo "[reel-pkg] 实体化拷贝解释器树 → ${VENV}（rsync -aL 解引用 symlink）"
-    rm -rf "${VENV}"
-    rsync -aL "${PY_HOME}/" "${VENV}/"
+    rm -rf "${VENV}"; mkdir -p "${VENV}"
+    if [[ "${OS_KEY}" == "win" ]]; then
+      echo "[reel-pkg] 拷贝解释器树 → ${VENV}（cp -R；Windows 标准库树无 symlink，python.exe 在树根自定位）"
+      cp -R "${PY_HOME}/." "${VENV}/"
+    else
+      echo "[reel-pkg] 实体化拷贝解释器树 → ${VENV}（rsync -aL 解引用 symlink）"
+      rsync -aL "${PY_HOME}/" "${VENV}/"
+    fi
     echo "[reel-pkg] 移除 PEP 668 EXTERNALLY-MANAGED 标记（引擎私有 python，允许装依赖）"
     find "${VENV}" -name EXTERNALLY-MANAGED -delete
     echo "[reel-pkg] 安装依赖到自身 site-packages (requirements.txt)"
-    "${VENV}/bin/python3.12" -m pip install --no-input --no-warn-script-location -r "${SRC}/requirements.txt"
+    "${VENV_PY}" -m pip install --no-input --no-warn-script-location -r "${SRC}/requirements.txt"
     # symlink 守卫：daemon unpack_zip 不还原 symlink，包内任何 symlink 都会损坏。
     if find "${STAGE}" -type l | grep -q .; then
       echo "[reel-pkg] ✗ 包内仍存在 symlink（daemon 解压不还原 symlink → 包会损坏）：" >&2
@@ -333,7 +349,21 @@ process_one_arch() {
   local PKG_PATH="${OUT_DIR}/${PKG_NAME}"
   rm -f "${PKG_PATH}"
   echo "[reel-pkg] 打包 → ${PKG_PATH}"
-  ( cd "${STAGE}" && zip -r -q -X "${PKG_PATH}" backend )
+  if command -v zip >/dev/null 2>&1; then
+    ( cd "${STAGE}" && zip -r -q -X "${PKG_PATH}" backend )
+  else
+    # 无 zip（如 Windows Git Bash）：用 python zipfile 打包，保持顶层 backend/（deflate 压缩）。
+    ( cd "${STAGE}" && PKG_OUT="${PKG_PATH}" python3 - <<'PY'
+import os, zipfile
+out = os.environ["PKG_OUT"]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, _dirs, files in os.walk("backend"):
+        for name in files:
+            full = os.path.join(root, name)
+            z.write(full, full.replace(os.sep, "/"))
+PY
+    )
+  fi
 
   local SHA256 SIZE
   if command -v sha256sum >/dev/null 2>&1; then
