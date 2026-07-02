@@ -34,3 +34,9 @@ debug_*.py
 test_*.py
 !test/services/test_*.py
 streamlit.log
+
+# 引擎打包上传配置（含 admin_token，禁入库；仅模板 scripts/config.example.yaml 进版本库）
+/scripts/config.yaml
+/scripts/config-dev.yaml
+# 引擎打包产物输出目录
+/.engine-build/
