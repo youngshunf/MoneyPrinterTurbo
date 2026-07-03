@@ -286,7 +286,15 @@ process_one_arch() {
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "${COPY_EXCLUDES[@]}" "${SRC}/" "${STAGE}/backend/"
   else
-    cp -R "${SRC}/." "${STAGE}/backend/"   # /. 拷内容而非把 backend 目录多套一层（Git Bash cp 语义）
+    # 无 rsync（Git Bash）：reel 的 SRC=fork 根、OUT=SRC/.engine-build 在 SRC **内部**，cp -R 会
+    # 「copy into itself」。改用 tar（-C 源 → 管道 → -C 目标）并**排除 .engine-build** 与大目录；
+    # tar 先读后写、自安全。__pycache__/*.pyc/storage/temp 残留由随后的 find/rm 兜底清理。
+    tar -C "${SRC}" \
+      --exclude=./.engine-build --exclude=./.git --exclude=./node_modules \
+      --exclude=./.venv --exclude='./.venv-*' \
+      --exclude=./webui --exclude=./docs --exclude=./tests --exclude=./test \
+      --exclude=./config.toml --exclude=./config.yaml --exclude=./reel_p0_compose.py \
+      -cf - . | tar -C "${STAGE}/backend" -xf -
     ( cd "${STAGE}/backend" && rm -rf .venv .venv-* .git node_modules tests test .pytest_cache .ruff_cache \
         config.toml config.yaml webui docs reel_p0_compose.py \
         && find . -name '__pycache__' -type d -prune -exec rm -rf {} + \
